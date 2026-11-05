@@ -5,5 +5,5 @@ compatibility_date = "2026-11-01"
 [[d1_databases]]
 binding = "DB"                    # your code reads this as env.DB
 database_name = "pesawatch"       # must match the name used in `wrangler d1 create`
-database_id = "PASTE-YOUR-D1-ID"  # run `npx wrangler d1 list` and copy the ID
+database_id = "fa51705d-be4b-4c0d-9e1d-1c71e2b1bc4c"  # run `npx wrangler d1 list` and copy the ID
 migrations_dir = "../migrations"  # migrations live one folder above /api
