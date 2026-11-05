@@ -1,0 +1,44 @@
+name: Run an ingest script
+
+# One reusable manual workflow: choose which script in /ingest to run.
+# Scripts should write any output files to the repo root (*.json) or ./reports/.
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "Script file in the ingest folder (e.g. probe_cob.py)"
+        required: true
+        default: "probe_cob.py"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run script
+        env:
+          SCRIPT: ${{ inputs.script }}
+        run: |
+          case "$SCRIPT" in
+            *[!A-Za-z0-9_.-]*) echo "Invalid script name"; exit 1;;
+          esac
+          python "ingest/$SCRIPT"
+
+      - name: Upload outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: script-output
+          path: |
+            *.json
+            reports/
+          if-no-files-found: ignore
