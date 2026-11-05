@@ -1,1 +1,31 @@
+name: Source connectivity check
 
+# Manual trigger first. Add a weekly schedule later if you want ongoing monitoring:
+#   schedule:
+#     - cron: "0 1 * * 1"   # Mondays 01:00 UTC (04:00 Nairobi)
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Probe official data sources
+        run: python ingest/check_sources.py
+
+      - name: Upload full report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sources-report
+          path: sources_report.json
