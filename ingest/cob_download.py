@@ -29,8 +29,11 @@ import requests
 MIN_FY = 2025        # only reports for financial years starting >= this (2025 = FY2025/26)
 MAX_FILES = 4        # first test: 4 files. Raise later (e.g. MIN_FY=2022, MAX_FILES=40).
 KINDS = ("national_birr", "county_birr")
+ONLY_IDS = [16378, 16376]  # retry just these two failures; set to [] to use MIN_FY/MAX_FILES instead
+READ_TIMEOUT = 600   # seconds to wait for the server to start/continue sending (it can be slow)
 PAUSE_SECONDS = 5    # polite gap between downloads
 RETRIES = 3
+SCRIPT_VERSION = "cob_download v2"
 # -------------------------------------------------------
 
 HEADERS = {"User-Agent": "PesaWatchKenya-cob-download/0.1 (public-finance transparency project)"}
@@ -45,6 +48,8 @@ def load_catalogue():
 
 
 def select(records):
+    if ONLY_IDS:
+        return [r for r in records if r["wpdm_id"] in ONLY_IDS], []
     chosen = [r for r in records
               if r.get("doc_kind") in KINDS and (r.get("fy_start") or 0) >= MIN_FY]
     skipped = [r for r in chosen if r.get("listing_size_zero")]
@@ -64,7 +69,8 @@ def download_one(rec, tmpdir):
         try:
             sha = hashlib.sha256()
             size = 0
-            with requests.get(rec["download_url"], headers=HEADERS, timeout=(15, 300), stream=True) as r:
+            with requests.get(rec["download_url"], headers=HEADERS, timeout=(15, READ_TIMEOUT), stream=True) as r:
+                out["ttfb_seconds"] = round(r.elapsed.total_seconds(), 1)
                 out["status"] = r.status_code
                 if r.status_code != 200:
                     raise RuntimeError(f"HTTP {r.status_code}")
@@ -97,8 +103,9 @@ def download_one(rec, tmpdir):
             os.remove(path)
             return out
         except Exception as e:  # noqa: BLE001
-            last = f"{type(e).__name__}: {str(e)[:150]}"
-            time.sleep(10 * attempt)
+            last = f"{type(e).__name__}: {str(e)[:150]} [configured read timeout={READ_TIMEOUT}s]"
+            print(f"   attempt {attempt} failed: {last}", flush=True)
+            time.sleep(30 * attempt)
     out.update(verdict="FAIL", error=last, attempts=RETRIES)
     return out
 
@@ -119,18 +126,24 @@ def main():
             time.sleep(PAUSE_SECONDS)
 
     manifest = {"generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "settings": {"MIN_FY": MIN_FY, "MAX_FILES": MAX_FILES, "KINDS": KINDS},
+                "settings": {"script_version": SCRIPT_VERSION, "MIN_FY": MIN_FY, "MAX_FILES": MAX_FILES,
+                             "KINDS": KINDS, "ONLY_IDS": ONLY_IDS, "READ_TIMEOUT": READ_TIMEOUT},
                 "skipped_zero_size": [{"wpdm_id": r["wpdm_id"], "title": r["title"]} for r in skipped],
                 "downloads": results}
     with open("reports/cob_downloads_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
-    lines = ["## COB downloads", "", "| Kind | FY | Period | Id | Verdict | Size (MB) | Listed | Seconds |",
-             "|---|---|---|---|---|---|---|---|"]
+    lines = ["## COB downloads", "", "| Kind | FY | Period | Id | Verdict | Size (MB) | Listed | Seconds | First byte (s) |",
+             "|---|---|---|---|---|---|---|---|---|"]
     for r in results:
         mb = round(r["bytes"] / 1048576, 2) if r.get("bytes") else ""
         lines.append(f"| {r['doc_kind']} | {r['fy_start']} | {r['period']} | {r['wpdm_id']} | "
-                     f"{r['verdict']} | {mb} | {r['listed_size']} | {r.get('seconds', '')} |")
+                     f"{r['verdict']} | {mb} | {r['listed_size']} | {r.get('seconds', '')} | {r.get('ttfb_seconds', '')} |")
+    lines.append("")
+    lines.append(f"Script version: {SCRIPT_VERSION} (read timeout {READ_TIMEOUT}s)")
+    for r in results:
+        if r.get("error"):
+            lines.append(f"- id {r['wpdm_id']}: {r['error']}")
     table = "\n".join(lines)
     print("\n" + table)
     path = os.environ.get("GITHUB_STEP_SUMMARY")
