@@ -25,9 +25,9 @@ import unicodedata
 import requests
 
 # ---------------- SETTINGS (edit these) ----------------
-MODE = "dry-run"            # "dry-run" or "load"
+MODE = "load"               # "dry-run" or "load"
 YEARS = [2026]              # which yearly OCDS files to process
-LIMIT_RECORDS = 0           # 0 = all; e.g. 300 for a first small real load
+LIMIT_RECORDS = 300         # 0 = all; 300 = small first real load (set to 0 for the full year)
 DAILY_WRITE_BUDGET = 80_000 # D1 free allows 100,000 rows written per UTC day; keep headroom
 MAX_REQUEST_CHARS = 70_000  # SQL text per API request
 MAX_STATEMENTS = 150
@@ -38,10 +38,6 @@ URL = "https://data.open-contracting.org/en/publication/147/download?name={year}
 HEADERS = {"User-Agent": "PesaWatchKenya-ocds-load/0.1 (public-finance transparency project)"}
 API = "https://api.cloudflare.com/client/v4"
 EXTREME_KES = 10_000_000_000  # flag, never delete
-# A tenderPeriod.startDate shared by at least this many tenders (or 1% of the file, if larger) is a system
-# placeholder, not a real opening date. In 2026 data: 30 June on 12,210 tenders and 31 Oct on 5,655.
-PLACEHOLDER_MIN_TENDERS = 100
-PLACEHOLDER_MIN_SHARE = 0.01
 
 COUNTIES = ["Mombasa", "Kwale", "Kilifi", "Tana River", "Lamu", "Taita-Taveta", "Garissa", "Wajir", "Mandera",
             "Marsabit", "Isiolo", "Meru", "Tharaka-Nithi", "Embu", "Kitui", "Machakos", "Makueni", "Nyandarua",
@@ -74,42 +70,6 @@ def match_county(buyer_name):
     return COUNTY_KEY.get(ALNUM(core))
 
 
-COUNTY_PREFIX = re.compile(r"(?i)\bcounty (assembly|commissioners?)( of)?\b")
-
-
-def county_from_stripped(name, pattern):
-    return COUNTY_KEY.get(ALNUM(re.sub(pattern, " ", name)))
-
-
-def classify_buyer(buyer_name):
-    """-> (buyer_type, county_code of its geography or None).
-
-    county_executive: "X County Government" (the entity whose budget the Controller of Budget reports on)
-    county_assembly: the county's legislature; a separate procuring entity, kept separate
-    county_commissioner: a national-government (Interior) official posted to a county, NOT a county government
-    other: everything else (ministries, state agencies, universities, hospitals, ...)
-    """
-    n = (buyer_name or "").strip()
-    low = n.casefold()
-    if "county government" in low:
-        return "county_executive", match_county(n)
-    if "county assembly" in low:
-        return "county_assembly", county_from_stripped(n, r"(?i)\bcounty assembly( of)?\b")
-    if "county commissioner" in low:
-        return "county_commissioner", county_from_stripped(n, r"(?i)\bcounty commissioners?\b")
-    return "other", None
-
-
-def find_placeholder_starts(records):
-    counts = collections.Counter()
-    for r in records:
-        d = d10((((r.get("tender") or {}).get("tenderPeriod")) or {}).get("startDate"))
-        if d:
-            counts[d] += 1
-    threshold = max(PLACEHOLDER_MIN_TENDERS, int(PLACEHOLDER_MIN_SHARE * len(records)))
-    return frozenset(d for d, n in counts.items() if n >= threshold)
-
-
 def d10(v):
     return v[:10] if isinstance(v, str) and len(v) >= 10 else None
 
@@ -125,16 +85,16 @@ def clip(s, n=500):
     return s[:n] if isinstance(s, str) else s
 
 
-def transform(r, placeholders=frozenset()):
+def transform(r):
     buyer = r.get("buyer") or {}
     t = r.get("tender") or {}
     tp = t.get("tenderPeriod") or {}
     rel, start, end = d10(r.get("date")), d10(tp.get("startDate")), d10(tp.get("endDate"))
     flags = []
-    if start and start in placeholders:
-        flags.append("start_placeholder")      # start date is a shared default, do not show or analyse it
-    elif start and end and start > end:
-        flags.append("period_inverted")
+    # Dry run showed 73% of 2026 tenders have a start date AFTER the end date (placeholder dates),
+    # so tender_start is treated as unreliable and left empty in that case. No per-row flag.
+    if start and end and start > end:
+        start = None
     if not t.get("mainProcurementCategory"):
         flags.append("no_category")
     parties = r.get("parties") or []
@@ -167,12 +127,10 @@ def transform(r, placeholders=frozenset()):
         buyer_id = int(buyer.get("id"))
     except (TypeError, ValueError):
         buyer_id = None
-    buyer_type, geo_county = classify_buyer(buyer.get("name"))
     tender = {"ocid": r["ocid"], "buyer_ppip_id": buyer_id, "buyer_name": (buyer.get("name") or "").strip() or None,
-              "county_code": match_county(buyer.get("name")), "buyer_type": buyer_type, "geo_county_code": geo_county,
-              "title": clip(t.get("title")),
+              "county_code": match_county(buyer.get("name")), "title": clip(t.get("title")),
               "procurement_method": t.get("procurementMethod"), "main_category": t.get("mainProcurementCategory"),
-              "fy_start": fy_of(rel or end), "release_date": rel, "tender_start": start, "tender_end": end,
+              "fy_start": fy_of(rel or start), "release_date": rel, "tender_start": start, "tender_end": end,
               "award_count": len(r.get("awards") or []), "bidder_count": len(supplier_party_ids) or None,
               "quality_flags": ",".join(flags) or None}
     return tender, awards, suppliers, supplier_party_ids
@@ -198,11 +156,10 @@ def insert(table, row):
 def record_statements(tender, awards, suppliers, doc_id, county_entity):
     stmts = [insert("suppliers", {"supplier_key": k, "name": clip(n, 300), "first_seen_ocid": tender["ocid"]})
              for k, n in suppliers.items()]
-    t = {k: v for k, v in tender.items() if k not in ("county_code", "geo_county_code")}
+    t = {k: v for k, v in tender.items() if k != "county_code"}
     t["buyer_entity_id"] = county_entity.get(tender["county_code"])
-    t["buyer_geo_entity_id"] = county_entity.get(tender["geo_county_code"])
     t["source_document_id"] = doc_id
-    order = ["ocid", "buyer_ppip_id", "buyer_name", "buyer_entity_id", "buyer_type", "buyer_geo_entity_id", "title", "procurement_method", "main_category",
+    order = ["ocid", "buyer_ppip_id", "buyer_name", "buyer_entity_id", "title", "procurement_method", "main_category",
              "fy_start", "release_date", "tender_start", "tender_end", "award_count", "bidder_count",
              "source_document_id", "quality_flags"]
     stmts.append(insert("tenders", {k: t[k] for k in order}))
@@ -260,20 +217,17 @@ def dry_run(year, records):
     raw_names, keys = set(), set()
     bidder_dist = collections.Counter()
     unmatched_counties = collections.Counter()
-    buyer_types, geo_matched = collections.Counter(), collections.Counter()
-    placeholders = find_placeholder_starts(records)
     est = 0
     for r in records:
-        tender, awards, suppliers, sp_ids = transform(r, placeholders)
+        tender, awards, suppliers, sp_ids = transform(r)
         _, w = record_statements(tender, awards, suppliers, 1, {})
         est += w
         c["tenders"] += 1
         c["awards_rows"] += len(awards)
         c["county_buyer_matched"] += tender["county_code"] is not None
-        buyer_types[tender["buyer_type"]] += 1
-        geo_matched[tender["buyer_type"]] += tender["geo_county_code"] is not None
-        if "county" in (tender["buyer_name"] or "").casefold() and tender["geo_county_code"] is None:
+        if "county" in (tender["buyer_name"] or "").casefold() and tender["county_code"] is None:
             unmatched_counties[tender["buyer_name"]] += 1
+        c["tender_start_null"] += tender["tender_start"] is None
         for f in (tender["quality_flags"] or "").split(","):
             if f:
                 c["flag_" + f] += 1
@@ -302,17 +256,16 @@ def dry_run(year, records):
         "supplier_ids_seen": len(id_tenders), "supplier_ids_used_in_more_than_one_tender": multi_id,
         "supplier_keys_with_more_than_one_id": keys_multi_ids, "supplier_keys_total_with_ids": len(key_ids),
         "supplier_party_count_on_awarded_tenders (6 = 6+)": dict(sorted(bidder_dist.items())),
-        "placeholder_start_dates": sorted(placeholders),
-        "buyer_types": dict(buyer_types),
-        "buyer_types_with_county_geography": dict(geo_matched),
-        "top_county_like_buyers_without_geography": unmatched_counties.most_common(15),
+        "top_unmatched_county_like_buyers": unmatched_counties.most_common(10),
     }
 
 
 def load_mode(year, records, sha, nbytes):
     db = D1()
-    placeholders = find_placeholder_starts(records)
-    print(f"placeholder start dates: {sorted(placeholders)}", flush=True)
+    cols = {row["name"] for row in db.run("PRAGMA table_info(tenders)")[0]}
+    if "bidder_count" not in cols:
+        sys.exit("The tenders table is missing or is the old layout. Apply migration 0003 first: "
+                 "npx wrangler d1 migrations apply pesawatch --remote")
     county_entity = {code: eid for eid, code in
                      [(row["id"], row["county_code"]) for row in db.run(
                          "SELECT id, county_code FROM entities WHERE kind='county'")[0]]}
@@ -355,7 +308,7 @@ def load_mode(year, records, sha, nbytes):
 
     stopped_for_budget = False
     for idx in range(start_idx, end_idx):
-        tender, awards, suppliers, _ = transform(records[idx], placeholders)
+        tender, awards, suppliers, _ = transform(records[idx])
         stmts, w = record_statements(tender, awards, suppliers, doc_id, county_entity)
         size = sum(len(s) for s in stmts)
         if batch and (chars + size > MAX_REQUEST_CHARS or len(batch) + len(stmts) > MAX_STATEMENTS):
@@ -369,7 +322,11 @@ def load_mode(year, records, sha, nbytes):
         est += w
     else:
         flush(end_idx, "complete" if end_idx == len(records) else "partial (limit)")
-    return {"year": year, "rows_written": written_total, "written_today": used, "stopped_for_budget": stopped_for_budget}
+    totals = db.run("SELECT (SELECT COUNT(*) FROM tenders) AS tenders, (SELECT COUNT(*) FROM awards) AS awards, "
+                    "(SELECT COUNT(*) FROM suppliers) AS suppliers, "
+                    "(SELECT COUNT(*) FROM tenders WHERE buyer_entity_id IS NOT NULL) AS county_tenders")[0][0]
+    return {"year": year, "rows_written_this_run": written_total, "written_today": used,
+            "stopped_for_budget": stopped_for_budget, "table_totals_in_d1": totals}
 
 
 def main():
