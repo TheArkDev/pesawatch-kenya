@@ -2,6 +2,7 @@
 // never the raw tenders/awards tables, to stay inside D1's free read budget.
 //
 // GET /health
+// GET /years                       financial years available (+ coverage) and the default year
 // GET /overview?fy=2025            national procurement overview + breakdowns + provenance
 // GET /counties?fy=2025            the 47 counties with procurement totals
 // GET /counties/:code?fy=2025      one county (code 1-47) and its buyers
@@ -82,6 +83,19 @@ export default {
       if (path === "/health") {
         const row = await db.prepare("SELECT COUNT(*) AS counties FROM entities WHERE kind = 'county'").first();
         return json({ ok: true, ...row }, 200, 60);
+      }
+
+      if (path === "/years") {
+        const { results } = await db
+          .prepare("SELECT fy_start, tenders, first_release_date, last_release_date FROM sum_fy_overview ORDER BY fy_start DESC")
+          .all<{ fy_start: number; tenders: number; first_release_date: string | null; last_release_date: string | null }>();
+        const years = results.map((r) => ({
+          fy: r.fy_start,
+          label: `${r.fy_start}/${String(r.fy_start + 1).slice(2)}`,
+          tenders: r.tenders,
+          coverage: coverage(r.fy_start, r.first_release_date, r.last_release_date),
+        }));
+        return json({ default_fy: await resolveFy(db, url), years });
       }
 
       if (path === "/overview") {
