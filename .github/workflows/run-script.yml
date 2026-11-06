@@ -13,13 +13,19 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Restore PDF cache (avoids re-downloading large reports)
+        uses: actions/cache@v4
+        with:
+          path: pdf_cache
+          key: cob-pdfs-v1
 
       - name: Install dependencies
         run: pip install requests pypdf
