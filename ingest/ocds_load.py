@@ -27,7 +27,7 @@ import requests
 # ---------------- SETTINGS (edit these) ----------------
 MODE = "load"               # "dry-run" or "load"
 YEARS = [2026]              # which yearly OCDS files to process
-LIMIT_RECORDS = 300         # 0 = all; 300 = small first real load (set to 0 for the full year)
+LIMIT_RECORDS = 0         # 0 = all; 300 = small first real load (set to 0 for the full year)
 DAILY_WRITE_BUDGET = 80_000 # D1 free allows 100,000 rows written per UTC day; keep headroom
 MAX_REQUEST_CHARS = 70_000  # SQL text per API request
 MAX_STATEMENTS = 150
