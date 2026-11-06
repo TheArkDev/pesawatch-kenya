@@ -26,12 +26,12 @@ import requests
 
 # ---------------- SETTINGS (edit these) ----------------
 MODE = "load"               # "dry-run" or "load"
-YEARS = [2026]              # which yearly OCDS files to process
-LIMIT_RECORDS = 0         # 0 = all; 300 = small first real load (set to 0 for the full year)
+YEARS = [2025, 2024, 2023, 2022]  # processed in order; stops when the daily write budget is reached
+LIMIT_RECORDS = 0           # 0 = all records; use a small number only for test loads
 DAILY_WRITE_BUDGET = 80_000 # D1 free allows 100,000 rows written per UTC day; keep headroom
 MAX_REQUEST_CHARS = 70_000  # SQL text per API request
 MAX_STATEMENTS = 150
-SCRIPT_VERSION = "ocds_load v2"
+SCRIPT_VERSION = "ocds_load v3"
 # -------------------------------------------------------
 
 URL = "https://data.open-contracting.org/en/publication/147/download?name={year}.jsonl.gz"
@@ -107,20 +107,26 @@ def transform(r):
         period = c.get("period") or a.get("contractPeriod") or {}
         amount = (a.get("value") or {}).get("amount")
         value = int(round(amount)) if isinstance(amount, (int, float)) else None
-        for s in (a.get("suppliers") or [None]):
+        sup_list = a.get("suppliers") or [None]
+        for si, s in enumerate(sup_list):
             name = ((s or {}).get("name") or "").strip()
             key = norm_name(name)
+            # Joint award (several suppliers): the full award value sits on the FIRST row only,
+            # so totals are never double counted.
+            row_value = value if si == 0 else None
             af = []
-            if value is not None and value <= 0:
+            if len(sup_list) > 1:
+                af.append("joint_award")
+            if row_value is not None and row_value <= 0:
                 af.append("value_zero")
-            if value is not None and value > EXTREME_KES:
+            if row_value is not None and row_value > EXTREME_KES:
                 af.append("value_extreme")
             if not key:
                 af.append("no_supplier")
             if key and key not in suppliers:
                 suppliers[key] = name
             awards.append({"ocid": r["ocid"], "award_id": str(a.get("id")), "supplier_key": key,
-                           "supplier_ppip_id": str((s or {}).get("id") or "") or None, "value_kes": value,
+                           "supplier_ppip_id": str((s or {}).get("id") or "") or None, "value_kes": row_value,
                            "contract_start": d10(period.get("startDate")), "contract_end": d10(period.get("endDate")),
                            "date_signed": d10(c.get("dateSigned")), "quality_flags": ",".join(af) or None})
     try:
@@ -336,7 +342,11 @@ def main():
     if MODE == "load" and not (os.environ.get("CLOUDFLARE_API_TOKEN") and os.environ.get("CLOUDFLARE_ACCOUNT_ID")):
         sys.exit("Load mode needs the Cloudflare secrets in the environment.")
     for year in YEARS:
-        records, sha, nbytes = load_year(year)
+        try:
+            records, sha, nbytes = load_year(year)
+        except requests.RequestException as e:
+            lines.append(f"### {year}: could not download ({type(e).__name__}); skipped")
+            continue
         if MODE == "dry-run":
             res = dry_run(year, records)
             out["years"][year] = res
@@ -347,6 +357,9 @@ def main():
             res = load_mode(year, records, sha, nbytes)
             out["years"][year] = res
             lines.append(f"### {year}: {res}")
+            if res.get("stopped_for_budget"):
+                lines.append("Daily write budget reached. Run again after 00:00 UTC to continue.")
+                break
     with open("reports/ocds_load_report.json", "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, default=str)
     text = "\n".join(lines)
