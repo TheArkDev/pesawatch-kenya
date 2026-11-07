@@ -25,7 +25,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: pdf_cache
-          key: cob-pdfs-v1
+          key: cob-pdfs-v2
+          restore-keys: |
+            cob-pdfs-
 
       - name: Install dependencies
         run: pip install requests pypdf
