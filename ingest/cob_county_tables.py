@@ -29,7 +29,10 @@ PAGE_LIMIT = 150        # chapter 2 summary tables sit near the front
 CACHE_DIR = "pdf_cache"
 
 NUMTOK = r"(?:-?\d[\d,]*(?:\.\d+)?|[-\u2013\u2014])"
-ROW_RE = re.compile(r"^\s*(?P<name>[A-Za-z][A-Za-z'\u2019\-\./ ]*?)\s+(?P<nums>" + NUMTOK + r"(?:\s+" + NUMTOK + r")*)\s*$")
+# Footnote markers such as * or a dagger can follow a county name (e.g. "Murang\u2019a*"); the first run lost
+# those rows (14 counties missing from the payables tables), so allow and ignore them.
+MARK = r"[*\u2020\u2021\u00a7\u00b9\u00b2\u00b3]*"
+ROW_RE = re.compile(r"^\s*(?P<name>[A-Za-z][A-Za-z'\u2019\-\./ ]*?)\s*" + MARK + r"\s+(?P<nums>" + NUMTOK + r"(?:\s+" + NUMTOK + r")*)\s*$")
 FRAG_RE = re.compile(r"^\s*[A-Za-z][A-Za-z'\u2019\-\./ ]{0,30}\s*$")
 TITLE_RE = re.compile(r"Table\s+\d+(?:\.\d+)*\s*[:.]?\s*[^\n]{3,140}")
 
@@ -105,7 +108,7 @@ def parse_pages(pages_text):
                 frag = None
                 # A line that starts like a table row but did not parse (e.g. columns run together):
                 # keep it so we can see it instead of silently losing a county or the Total row.
-                head = re.match(r"^\s*([A-Za-z][A-Za-z'\u2019\-\./ ]*?)\s*\d", line)
+                head = re.match(r"^\s*([A-Za-z][A-Za-z'\u2019\-\./ ]*?)\s*" + MARK + r"\s*\d", line)
                 if head and re.search(r"\d", line):
                     nm = head.group(1).strip()
                     if nm.lower() in ("total", "grand total", "totals") or COUNTY_KEY.get(ALNUM(nm)):
@@ -181,6 +184,20 @@ def analyse(pdf_path):
         head = [ln.strip()[:150] for ln in dict(pages_text)[first].splitlines() if ln.strip()][:14]
         t["page_head_lines"] = head
         out.append(t)
+    pt = dict(pages_text)
+    for t in out:
+        v = t["validation"]
+        if 35 <= v["counties_found"] < 47:
+            ctx = {}
+            for name in v["missing_counties"]:
+                key = ALNUM(name)[:5]
+                hits = []
+                for pg in t["pages"]:
+                    for ln in pt[pg].splitlines():
+                        if ALNUM(ln).startswith(key):
+                            hits.append({"page": pg, "line": re.sub(r"\s+", " ", ln.strip())[:170]})
+                ctx[name] = hits[:3]
+            v["missing_county_lines"] = ctx
     return out, len(reader.pages)
 
 
@@ -202,6 +219,9 @@ def main():
         lines.append(f"- title guess: {t['title_guess']}")
         lines.append(f"- counties {v['counties_found']}/47, rows {v['rows']}, total row: {v['has_total_row']}, "
                      f"missing: {v['missing_counties'] or 'none'}, duplicates: {v['duplicate_codes'] or 'none'}")
+        if v.get("missing_county_lines"):
+            shown = {k: [h["line"] for h in hits][:1] for k, hits in list(v["missing_county_lines"].items())[:5]}
+            lines.append(f"- lines starting with a missing county (first 5): {shown}")
         if v["unparsed_lines"]:
             lines.append(f"- UNPARSED row-like lines: {v['unparsed_lines'][:4]}")
         lines.append(f"- worst column-sum difference vs Total row: {worst}%")
