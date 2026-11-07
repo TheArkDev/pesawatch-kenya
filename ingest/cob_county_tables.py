@@ -117,8 +117,16 @@ def parse_pages(pages_text):
 
 
 def build_tables(events):
+    """Group county rows into tables.
+
+    A row with a different number of values than the table (a blank cell instead of a dash) used to close
+    the table and silently drop everything after it. Now, if the NEXT county row is back to the table's
+    column count, the odd row is kept aside as 'irregular_rows' and the table continues.
+    """
     tables, cur, last_title = [], None, None
-    for ev in events:
+    county_idx = [i for i, e in enumerate(events) if e[0] == "county"]
+    next_county = {a: events[b] for a, b in zip(county_idx, county_idx[1:])}
+    for i, ev in enumerate(events):
         kind = ev[0]
         if kind == "title":
             last_title = ev[2]
@@ -129,6 +137,12 @@ def build_tables(events):
             continue
         if kind == "county":
             _, pno, code, name, nums = ev
+            if cur and cur["total"] is None and len(nums) != cur["ncols"]:
+                nxt = next_county.get(i)
+                if nxt and len(nxt[4]) == cur["ncols"] and nxt[1] - pno <= 1:
+                    cur.setdefault("irregular_rows", []).append(
+                        {"county_code": code, "name_in_pdf": name, "page": pno, "values": nums})
+                    continue
             if cur and (len(nums) != cur["ncols"] or pno - cur["pages"][-1] > 1 or cur["total"] is not None):
                 tables.append(cur)
                 cur = None
@@ -166,6 +180,7 @@ def validate(table):
                              "diff_pct": round(100 * abs(s - tot) / abs(tot), 3)})
     return {"counties_found": len(seen), "rows": len(codes), "missing_counties": missing,
             "unparsed_lines": table.get("unparsed_lines", []),
+            "irregular_rows": table.get("irregular_rows", []),
             "duplicate_codes": dupes, "has_total_row": table["total"] is not None, "column_sums": sums}
 
 
@@ -219,6 +234,9 @@ def main():
         lines.append(f"- title guess: {t['title_guess']}")
         lines.append(f"- counties {v['counties_found']}/47, rows {v['rows']}, total row: {v['has_total_row']}, "
                      f"missing: {v['missing_counties'] or 'none'}, duplicates: {v['duplicate_codes'] or 'none'}")
+        if v.get("irregular_rows"):
+            lines.append(f"- IRREGULAR rows kept aside (different number of values): "
+                         f"{[(r['name_in_pdf'], r['values']) for r in v['irregular_rows']][:6]}")
         if v.get("missing_county_lines"):
             shown = {k: [h["line"] for h in hits][:1] for k, hits in list(v["missing_county_lines"].items())[:5]}
             lines.append(f"- lines starting with a missing county (first 5): {shown}")
