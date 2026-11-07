@@ -7,6 +7,7 @@
 // GET /counties?fy=2025            the 47 counties with procurement totals
 // GET /counties/:code?fy=2025      one county (code 1-47) and its buyers
 // GET /suppliers/top?fy=&limit=20  suppliers by awarded value (name-matched, see notes)
+// GET /budget/counties?fy=2025     county approved budget, exchequer issues, expenditure, absorption
 
 export interface Env {
   DB: D1Database;
@@ -19,6 +20,13 @@ const NOTES = [
   "Award values above KSh 10 billion are flagged as probable data errors and excluded from totals.",
   "Suppliers are matched by normalised company name only; names may be merged or split incorrectly.",
   "Financial year runs July to June (fy=2025 means 2025/26).",
+];
+
+const BUDGET_NOTES = [
+  "Source: Office of the Controller of Budget, county budget implementation review report (annual), as published. Figures are reported by counties and are not audited.",
+  "Approved budget is the county's approved estimates. Exchequer issues are funds released to the county by the National Treasury. Expenditure is as reported by the county. These are different measures and must not be read as one another.",
+  "Absorption rate is reported expenditure divided by the approved budget. A low rate can reflect delays or late releases; it is not by itself evidence of wrongdoing.",
+  "The source reports in KSh millions, so amounts are rounded to that level. Each figure carries the report table and PDF page it came from.",
 ];
 
 const CORS = { "Access-Control-Allow-Origin": "*" };
@@ -62,15 +70,24 @@ function coverage(fy: number, first: string | null, last: string | null) {
   return { first_release_date: first, last_release_date: last, in_progress: inProgress, complete: warnings.length === 0, warnings };
 }
 
-async function provenance(db: D1Database) {
+async function provenance(db: D1Database, sourceId = "ppip_ocds") {
   const { results } = await db
     .prepare(
       "SELECT title, url, retrieved_at, substr(sha256,1,12) AS sha256_prefix FROM source_documents " +
-        "WHERE source_id = 'ppip_ocds' AND status = 'available' ORDER BY retrieved_at DESC LIMIT 5"
+        "WHERE source_id = ? AND status = 'available' ORDER BY retrieved_at DESC LIMIT 5"
     )
+    .bind(sourceId)
     .all();
   return results;
 }
+
+type BudgetRow = {
+  county_code: number; name: string; approved_budget: number | null; exchequer_release: number | null;
+  reported_expenditure: number | null; dev_approved: number | null; dev_expenditure: number | null;
+};
+
+const pct = (num: number | null, den: number | null): number | null =>
+  num !== null && den ? Math.round((1000 * num) / den) / 10 : null;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -116,6 +133,48 @@ export default {
         });
       }
 
+      if (path === "/budget/counties") {
+        let fy: number | null;
+        const q = url.searchParams.get("fy");
+        if (q !== null) {
+          const n = Number(q);
+          fy = Number.isInteger(n) && n >= 2010 && n <= 2035 ? n : null;
+        } else {
+          const row = await db.prepare("SELECT MAX(fy_start) AS fy FROM dash_entity_fy WHERE as_of_period = 'annual'").first<{ fy: number | null }>();
+          fy = row?.fy ?? null;
+        }
+        if (fy === null) return json({ error: "no budget data" }, 404);
+        const { results } = await db
+          .prepare(
+            "SELECT e.county_code, e.name, d.approved_budget, d.exchequer_release, d.reported_expenditure, d.dev_approved, d.dev_expenditure " +
+              "FROM dash_entity_fy d JOIN entities e ON e.id = d.entity_id " +
+              "WHERE d.fy_start = ? AND d.as_of_period = 'annual' AND e.kind = 'county' ORDER BY e.county_code"
+          )
+          .bind(fy)
+          .all<BudgetRow>();
+        if (results.length === 0) return json({ error: `no budget data for fy ${fy}` }, 404);
+        const { results: flags } = await db
+          .prepare(
+            "SELECT DISTINCT e.county_code, e.name, f.note FROM fiscal_facts f JOIN entities e ON e.id = f.entity_id " +
+              "WHERE f.fy_start = ? AND f.note IS NOT NULL ORDER BY e.county_code"
+          )
+          .bind(fy)
+          .all();
+        const sum = (k: keyof BudgetRow) => results.reduce((a, r) => a + ((r[k] as number | null) ?? 0), 0);
+        const totals = {
+          approved_budget: sum("approved_budget"), exchequer_release: sum("exchequer_release"),
+          reported_expenditure: sum("reported_expenditure"), dev_approved: sum("dev_approved"), dev_expenditure: sum("dev_expenditure"),
+        };
+        return json({
+          fy, label: `${fy}/${String(fy + 1).slice(2)}`,
+          counties: results.map((r) => ({
+            ...r, absorption_pct: pct(r.reported_expenditure, r.approved_budget), dev_absorption_pct: pct(r.dev_expenditure, r.dev_approved),
+          })),
+          totals: { ...totals, absorption_pct: pct(totals.reported_expenditure, totals.approved_budget), dev_absorption_pct: pct(totals.dev_expenditure, totals.dev_approved) },
+          data_flags: flags, notes: BUDGET_NOTES, source: await provenance(db, "cob"),
+        });
+      }
+
       if (path === "/counties") {
         const fy = await resolveFy(db, url);
         if (fy === null) return json({ error: "no data or invalid fy" }, 404);
@@ -147,7 +206,18 @@ export default {
           )
           .bind(fy, ent.id)
           .all();
-        return json({ fy, county: ent, buyers, notes: NOTES, source: await provenance(db) });
+        const { results: budgetFacts } = await db
+          .prepare(
+            "SELECT measure, spend_type, classification_id, amount_kes, page_ref, review_status, note FROM fiscal_facts " +
+              "WHERE entity_id = ? AND fy_start = ? AND as_of_period = 'annual' ORDER BY measure, spend_type, classification_id"
+          )
+          .bind(ent.id, fy)
+          .all();
+        return json({
+          fy, county: ent, buyers, notes: NOTES, source: await provenance(db),
+          budget_facts: budgetFacts, budget_notes: BUDGET_NOTES,
+          budget_source: budgetFacts.length ? await provenance(db, "cob") : [],
+        });
       }
 
       if (path === "/suppliers/top") {
