@@ -26,6 +26,7 @@ const BUDGET_NOTES = [
   "Source: Office of the Controller of Budget, county budget implementation review report (annual), as published. Figures are reported by counties and are not audited.",
   "Approved budget is the county's approved estimates. Exchequer issues are funds released to the county by the National Treasury. Expenditure is as reported by the county. These are different measures and must not be read as one another.",
   "Absorption rate is reported expenditure divided by the approved budget. A low rate can reflect delays or late releases; it is not by itself evidence of wrongdoing.",
+  "Pending bills are amounts a county owed suppliers, staff and statutory bodies at year end but had not paid, as reported by counties. They include unpaid salaries and statutory deductions.",
   "The source reports in KSh millions, so amounts are rounded to that level. Each figure carries the report table and PDF page it came from.",
 ];
 
@@ -84,6 +85,7 @@ async function provenance(db: D1Database, sourceId = "ppip_ocds") {
 type BudgetRow = {
   county_code: number; name: string; approved_budget: number | null; exchequer_release: number | null;
   reported_expenditure: number | null; dev_approved: number | null; dev_expenditure: number | null;
+  pending_bills: number | null;
 };
 
 const pct = (num: number | null, den: number | null): number | null =>
@@ -146,7 +148,7 @@ export default {
         if (fy === null) return json({ error: "no budget data" }, 404);
         const { results } = await db
           .prepare(
-            "SELECT e.county_code, e.name, d.approved_budget, d.exchequer_release, d.reported_expenditure, d.dev_approved, d.dev_expenditure " +
+            "SELECT e.county_code, e.name, d.approved_budget, d.exchequer_release, d.reported_expenditure, d.dev_approved, d.dev_expenditure, d.pending_bills " +
               "FROM dash_entity_fy d JOIN entities e ON e.id = d.entity_id " +
               "WHERE d.fy_start = ? AND d.as_of_period = 'annual' AND e.kind = 'county' ORDER BY e.county_code"
           )
@@ -164,13 +166,15 @@ export default {
         const totals = {
           approved_budget: sum("approved_budget"), exchequer_release: sum("exchequer_release"),
           reported_expenditure: sum("reported_expenditure"), dev_approved: sum("dev_approved"), dev_expenditure: sum("dev_expenditure"),
+          pending_bills: sum("pending_bills"),
         };
         return json({
           fy, label: `${fy}/${String(fy + 1).slice(2)}`,
           counties: results.map((r) => ({
             ...r, absorption_pct: pct(r.reported_expenditure, r.approved_budget), dev_absorption_pct: pct(r.dev_expenditure, r.dev_approved),
+            pending_pct_of_budget: pct(r.pending_bills, r.approved_budget),
           })),
-          totals: { ...totals, absorption_pct: pct(totals.reported_expenditure, totals.approved_budget), dev_absorption_pct: pct(totals.dev_expenditure, totals.dev_approved) },
+          totals: { ...totals, absorption_pct: pct(totals.reported_expenditure, totals.approved_budget), dev_absorption_pct: pct(totals.dev_expenditure, totals.dev_approved), pending_pct_of_budget: pct(totals.pending_bills, totals.approved_budget) },
           data_flags: flags, notes: BUDGET_NOTES, source: await provenance(db, "cob"),
         });
       }
