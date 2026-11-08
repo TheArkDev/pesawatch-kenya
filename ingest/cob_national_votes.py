@@ -16,7 +16,7 @@ from pypdf import PdfReader
 
 CACHE = os.path.join("pdf_cache", "national_annual_2025_26.pdf")
 PAGE_FROM, PAGE_TO = 90, 340        # chapter 4 sector analyses; widen if tables are missing
-PRE_MIN_NUMBER_LINES = 3            # a candidate page has at least this many lines with 10+ numbers
+PRE_MIN_NUMBER_LINES = 1            # a candidate page has at least this many lines with 10+ numbers
 MIN_VALUES = 8                      # numbers needed on a line to count as a data row
 ROW_TOL = 3.5                       # points: numbers within this vertical distance share a row
 LINE_TOL = 2.5                      # points: name words within this share a name line
@@ -62,55 +62,68 @@ def join_name(parts):
     return out
 
 
-def split_names(rows, lines):
+def split_names(rows, lines, line_h=10.0):
     """Attach name lines to rows. Names are vertically centred on their numbers line, so for each gap between two
     rows the lines split into 'tail of the row above' and 'head of the row below', with |head - tail| <= 1 for
-    every row. Pick the split pattern with the least total vertical distance (ties resolved by geometry)."""
+    every row. Lines above the first row or below the last row that sit close to it belong to it (they are the
+    head/tail of its name); farther ones are header or footer text and are dropped."""
     n = len(rows)
     gaps = [[] for _ in range(n + 1)]
     for ln in lines:
         gaps[sum(1 for r in rows if r["yc"] < ln["yc"])].append(ln)
     for g in gaps:
         g.sort(key=lambda ln: ln["yc"])
+    reach = MAX_NAME_DY * line_h
+    gaps[0] = [l for l in gaps[0] if rows[0]["yc"] - l["yc"] <= reach]
+    gaps[n] = [l for l in gaps[n] if l["yc"] - rows[-1]["yc"] <= reach]
     INF = float("inf")
-    memo = {}
 
-    def best(j, h):
-        """Min cost for rows j..n-1 when row j has h head lines taken from the bottom of gap j."""
-        key = (j, h)
-        if key in memo:
-            return memo[key]
-        head = gaps[j][len(gaps[j]) - h:] if h else []
-        head_cost = sum(abs(l["yc"] - rows[j]["yc"]) for l in head)
-        out = (INF, None)
-        for t in (h - 1, h, h + 1):
-            if t < 0 or t > len(gaps[j + 1]):
-                continue
-            tail = gaps[j + 1][:t]
-            cost = head_cost + sum(abs(l["yc"] - rows[j]["yc"]) for l in tail)
-            # A line ending in a hyphen continues on the next line, so the two must belong to the same row.
-            last_text = tail[-1]["text"] if tail else rows[j].get("own_text", "")
-            more_follows = (t < len(gaps[j + 1])) or j < n - 1
-            if more_follows and last_text.rstrip().endswith("-"):
-                cost += 1000.0
-            if j == n - 1:
-                cand = (cost, [(h, t)])
-            else:
-                nxt_h = len(gaps[j + 1]) - t
-                sub = best(j + 1, nxt_h)
-                if sub[0] == INF:
+    def solve(strict):
+        memo = {}
+
+        def best(j, h):
+            key = (j, h)
+            if key in memo:
+                return memo[key]
+            head = gaps[j][len(gaps[j]) - h:] if h else []
+            head_cost = sum(abs(l["yc"] - rows[j]["yc"]) for l in head)
+            out = (INF, None)
+            for t in (h - 1, h, h + 1):
+                if t < 0 or t > len(gaps[j + 1]):
                     continue
-                cand = (cost + sub[0], [(h, t)] + sub[1])
-            if cand[0] < out[0]:
-                out = cand
-        memo[key] = out
-        return out
+                if j == n - 1 and strict and t != len(gaps[n]):
+                    continue
+                tail = gaps[j + 1][:t]
+                cost = head_cost + sum(abs(l["yc"] - rows[j]["yc"]) for l in tail)
+                # A line ending in a hyphen continues on the next line, so the two must belong to the same row.
+                last_text = tail[-1]["text"] if tail else rows[j].get("own_text", "")
+                more_follows = (t < len(gaps[j + 1])) or j < n - 1
+                if more_follows and last_text.rstrip().endswith("-"):
+                    cost += 1000.0
+                if j == n - 1:
+                    cand = (cost, [(h, t)])
+                else:
+                    sub = best(j + 1, len(gaps[j + 1]) - t)
+                    if sub[0] == INF:
+                        continue
+                    cand = (cost + sub[0], [(h, t)] + sub[1])
+                if cand[0] < out[0]:
+                    out = cand
+            memo[key] = out
+            return out
 
-    choice = (INF, None)
-    for h0 in range(0, len(gaps[0]) + 1):       # extra lines above the first head are header text
-        c = best(0, h0)
-        if c[0] < choice[0]:
-            choice = c
+        starts = [len(gaps[0])] if strict else range(0, len(gaps[0]) + 1)
+        choice = (INF, None)
+        for h0 in starts:
+            c = best(0, h0)
+            if c[0] < choice[0]:
+                choice = c
+        return choice
+
+    choice = solve(True)
+    strict_ok = choice[1] is not None
+    if not strict_ok:
+        choice = solve(False)
     if choice[1] is None:                       # constraints impossible: fall back to nearest row
         for ln in lines:
             near = min(rows, key=lambda r: abs(r["yc"] - ln["yc"]))
@@ -166,17 +179,19 @@ def page_rows(page, diag=None):
     for ln in lines:
         ln["text"] = " ".join(w["text"] for w in sorted(ln["words"], key=lambda w: w["x0"]))
         ln["bold"] = any("bold" in (w.get("fontname") or "").lower() for w in ln["words"])
-    bold = [ln["text"] for ln in lines if ln["bold"]]
-    lines = [ln for ln in lines if not ln["bold"] and not re.match(r"(?i)^(source|note)\b", ln["text"])]
-    rest = []
-    for ln in lines:                      # name text printed on the numbers line itself
+    bold, rest = [], []
+    spacing = sorted(b["yc"] - a["yc"] for a, b in zip(lines, lines[1:]) if 4 < b["yc"] - a["yc"] < 20)
+    line_h = spacing[len(spacing) // 2] if spacing else 10.0
+    for ln in lines:                      # name text printed on the numbers line itself (bold 'Total' included)
         near = min(rows, key=lambda r: abs(r["yc"] - ln["yc"]))
         if abs(near["yc"] - ln["yc"]) <= LINE_TOL + 1.0:
             near["frags"].append((ln["yc"], ln["text"]))
             near["own_text"] = (near.get("own_text", "") + " " + ln["text"]).strip()
-        else:
+        elif ln["bold"]:
+            bold.append(ln["text"])       # bold text away from the numbers is a heading
+        elif not re.match(r"(?i)^(source|note)\b", ln["text"]):
             rest.append(ln)
-    ok = split_names(rows, rest)
+    ok = split_names(rows, rest, line_h)
     out = []
     for j, r in enumerate(rows):
         frags = [t for _, t in sorted(r["frags"])]       # top to bottom (pdfplumber y grows downward)
