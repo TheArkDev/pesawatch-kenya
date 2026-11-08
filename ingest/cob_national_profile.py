@@ -18,8 +18,8 @@ HEADERS = {"User-Agent": "PesaWatchKenya-cob-national/0.1 (public-finance transp
 URL = ("https://cob.go.ke/download/national-government-budget-implementation-review-report-fy-2025-2026/"
        "?wpdmdl=16454")
 CACHE = os.path.join("pdf_cache", "national_annual_2025_26.pdf")
-DUMP_PAGES = [57, 58, 59, 60, 61, 62, 262, 263]   # chapter 3 summary tables + one sector table
-LINES_PER_DUMP = 80
+DUMP_PAGES = [69, 70, 79, 80, 85, 88, 93, 96, 97, 262]   # MDA tables 3.10/3.11, compensation 3.12, payables 3.14, sector examples
+LINES_PER_DUMP = 90
 TITLE_RE = re.compile(r"^\s*(Table\s+\d+\.\d+\s*[:.]?\s*.{3,150})$")
 
 
@@ -49,9 +49,84 @@ def page_text(page):
         return page.extract_text() or ""
 
 
+NUM = r"(?:\(?-?\d[\d,]*(?:\.\d+)?\)?%?|[-\u2013\u2014])"
+_NUMS = NUM + r"(?:\s+" + NUM + r"){5,}"
+# A name must be separated from the numbers by whitespace, so "Allo-" (name wrapped with a hyphen) is not
+# mistaken for a dash value. Lines that are all numbers are also rows (name printed on other lines).
+NUM_ROW = re.compile(r"^(?:(?P<name>.*?)\s+)?(?P<nums>" + _NUMS + r")\s*$")
+LINE_TOL = 2.5      # points: fragments with y within this belong to one printed line
+MAX_DY = 30.0       # points: how far a name fragment may sit from the numbers line it belongs to
+
+
+def lines_with_positions(page):
+    """Text lines with their y position, built from positioned text fragments."""
+    frags = []
+
+    def visitor(text, cm, tm, font_dict, font_size):
+        t = (text or "").replace("\n", " ").strip()
+        if not t:
+            return
+        x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
+        y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+        frags.append((y, x, t))
+
+    page.extract_text(visitor_text=visitor)
+    frags.sort(key=lambda f: (-f[0], f[1]))
+    lines = []
+    for y, x, t in frags:
+        if lines and abs(lines[-1]["y"] - y) <= LINE_TOL:
+            lines[-1]["parts"].append((x, t))
+        else:
+            lines.append({"y": y, "parts": [(x, t)]})
+    for ln in lines:
+        ln["parts"].sort()
+        ln["text"] = re.sub(r"\s+", " ", " ".join(t for _, t in ln["parts"])).strip()
+    return lines
+
+
+def join_name(parts):
+    out = ""
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        out = out[:-1] + part if out.endswith("-") else (out + " " + part if out else part)
+    return out
+
+
+def vote_rows(page):
+    """Rows with >= 6 numbers; wrapped names rebuilt by attaching each text-only line to the nearest numbers line."""
+    lines = lines_with_positions(page)
+    rows, texts = [], []
+    for ln in lines:
+        m = NUM_ROW.match(ln["text"])
+        if m:
+            name = (m.group("name") or "").strip()
+            values = m.group("nums").split()
+            if name and re.fullmatch(NUM + r"(?:\s+" + NUM + r")*", name):   # line is all numbers, no name text
+                values, name = name.split() + values, ""
+            rows.append({"y": ln["y"], "name_part": name, "values": values, "frags": []})
+        elif ln["text"]:
+            texts.append(ln)
+    for t in texts:
+        if not rows:
+            break
+        nearest = min(rows, key=lambda r: abs(r["y"] - t["y"]))
+        if abs(nearest["y"] - t["y"]) <= MAX_DY:
+            nearest["frags"].append((t["y"], t["text"]))
+    out = []
+    for r in rows:
+        above = [txt for y, txt in sorted(r["frags"], key=lambda f: -f[0]) if y > r["y"]]
+        below = [txt for y, txt in sorted(r["frags"], key=lambda f: -f[0]) if y <= r["y"]]
+        out.append({"name": join_name(above + [r["name_part"]] + below), "values": r["values"],
+                    "n_values": len(r["values"]), "fragments_above": above, "name_on_numbers_line": r["name_part"],
+                    "fragments_below": below})
+    return out
+
+
 def profile(path):
     reader = PdfReader(path)
-    titles, dumps = [], {}
+    titles, dumps, row_reads = [], {}, {}
     for i, page in enumerate(reader.pages, 1):
         try:
             text = page_text(page)
@@ -69,7 +144,13 @@ def profile(path):
                 if len(keep) >= LINES_PER_DUMP:
                     break
             dumps[str(i)] = keep
-    return {"pages": len(reader.pages), "table_titles": titles, "page_dumps": dumps}
+            try:
+                rr = vote_rows(page)
+                if len(rr) >= 3:
+                    row_reads[str(i)] = rr
+            except Exception as e:  # noqa: BLE001
+                row_reads[str(i)] = [{"error": f"{type(e).__name__}: {str(e)[:150]}"}]
+    return {"pages": len(reader.pages), "table_titles": titles, "page_dumps": dumps, "row_reads": row_reads}
 
 
 def main():
