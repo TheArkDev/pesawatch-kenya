@@ -235,12 +235,12 @@ def assemble(pages_rows):
 
 def main():
     os.makedirs("reports", exist_ok=True)
-    if not os.path.exists(CACHE):
-        raise SystemExit("National PDF not cached: run cob_national_profile.py first (it downloads it).")
-    cands = prefilter(CACHE)
+    from cob_national_profile import get_pdf     # uses the cache if present, otherwise downloads (about 15 MB)
+    path, _sha = get_pdf()
+    cands = prefilter(path)
     print(f"{len(cands)} candidate pages between {PAGE_FROM} and {PAGE_TO}: {cands[:40]}", flush=True)
     pages_rows, diags = [], {}
-    with pdfplumber.open(CACHE) as pdf:
+    with pdfplumber.open(path) as pdf:
         for n, pg in enumerate(cands):
             d = {}
             try:
