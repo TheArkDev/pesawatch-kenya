@@ -38,6 +38,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          SCRIPT="$(printf '%s' "$SCRIPT" | tr -d '[:space:]')"   # ignore stray spaces typed or pasted into the box
           case "$SCRIPT" in
             *[!A-Za-z0-9_.-]*) echo "Invalid script name"; exit 1;;
           esac
