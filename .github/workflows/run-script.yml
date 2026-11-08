@@ -25,7 +25,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: pdf_cache
-          key: cob-pdfs-v2
+          key: cob-pdfs-${{ github.run_id }}
           restore-keys: |
             cob-pdfs-
 
