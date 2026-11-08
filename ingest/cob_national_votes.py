@@ -62,6 +62,35 @@ def join_name(parts):
     return out
 
 
+def assign_by_blocks(rows, rest, line_h):
+    """Rows of a table have padding, so name lines form blocks separated by a bigger gap than the gap between two
+    lines of the same name. If every block holds exactly one numbers row, each block's lines belong to that row.
+    Returns False (leaving rows untouched) when the blocks are not clean, so the caller can use the fallback."""
+    items = [(r["yc"], None, r) for r in rows] + [(l["yc"], l, None) for l in rest]
+    # lines that sit on a numbers line are already attached; use the rows themselves as anchors
+    items.sort(key=lambda it: it[0])
+    blocks, cur = [], [items[0]]
+    for prev, it in zip(items, items[1:]):
+        if it[0] - prev[0] > 1.3 * line_h:
+            blocks.append(cur)
+            cur = []
+        cur.append(it)
+    blocks.append(cur)
+    plan = []
+    for b in blocks:
+        owners = [r for _, l, r in b if r is not None]
+        texts = [l for _, l, r in b if l is not None]
+        if len(owners) == 1:
+            plan.append((owners[0], texts))
+        elif len(owners) == 0:
+            continue                      # heading or footer text far from any numbers row
+        else:
+            return False                  # two rows in one block: padding too small to tell
+    for owner, texts in plan:
+        owner["frags"] += [(l["yc"], l["text"]) for l in texts]
+    return True
+
+
 def split_names(rows, lines, line_h=10.0):
     """Attach name lines to rows. Names are vertically centred on their numbers line, so for each gap between two
     rows the lines split into 'tail of the row above' and 'head of the row below', with |head - tail| <= 1 for
@@ -136,6 +165,21 @@ def split_names(rows, lines, line_h=10.0):
     return True
 
 
+def row_check(values):
+    """For the 12-column vote rows: printed percentages must match the amounts (percentages are whole numbers)."""
+    if len(values) != 12:
+        return "not 12 values"
+    v = [to_float(x) for x in values]
+    bad = []
+    for base in (0, 6):
+        gross, net, exch, exp, p_exch, p_exp = v[base:base + 6]
+        if gross and exp is not None and p_exp is not None and abs(100 * exp / gross - p_exp) > 1.01:
+            bad.append(f"expenditure% {round(100 * exp / gross, 1)} vs printed {p_exp}")
+        if net and exch is not None and p_exch is not None and abs(100 * exch / net - p_exch) > 1.01:
+            bad.append(f"exchequer% {round(100 * exch / net, 1)} vs printed {p_exch}")
+    return "ok" if not bad else "; ".join(bad)
+
+
 def page_rows(page, diag=None):
     words = page.extract_words(x_tolerance=1.5, y_tolerance=2, keep_blank_chars=False,
                                extra_attrs=["fontname", "size"])
@@ -191,7 +235,13 @@ def page_rows(page, diag=None):
             bold.append(ln["text"])       # bold text away from the numbers is a heading
         elif not re.match(r"(?i)^(source|note)\b", ln["text"]):
             rest.append(ln)
-    ok = split_names(rows, rest, line_h)
+    ys = sorted([r["yc"] for r in rows] + [l["yc"] for l in rest])
+    deltas = [round(b - a, 1) for a, b in zip(ys, ys[1:])][:30]     # real row padding, for tuning
+    ok = assign_by_blocks(rows, rest, line_h)
+    method = "gaps"
+    if not ok:
+        ok = split_names(rows, rest, line_h)
+        method = "constrained-nearest"
     out = []
     for j, r in enumerate(rows):
         frags = [t for _, t in sorted(r["frags"])]       # top to bottom (pdfplumber y grows downward)
@@ -203,10 +253,11 @@ def page_rows(page, diag=None):
             if own > LINE_TOL + 1.0 and others and abs(own - min(others)) < 1.5:
                 uncertain = True
         out.append({"name": join_name(frags), "name_lines": frags, "values": r["values"], "yc": round(r["yc"], 1),
-                    "name_uncertain": uncertain})
+                    "name_uncertain": uncertain and method != "gaps", "row_check": None if re.fullmatch(r"(?i)total", join_name(frags).strip()) else row_check(r["values"])})
     if diag is not None:
         diag.update({"first_numeric_column_cut_x": round(cut, 1), "name_column_right_edge": round(name_right, 1),
-                     "rows": len(out), "constraint_split_ok": ok, "bold_lines_ignored": bold[:6]})
+                     "rows": len(out), "constraint_split_ok": ok, "name_assignment": method,
+                     "bold_lines_ignored": bold[:6], "line_height": round(line_h, 1), "first_y_gaps": deltas})
     return out, cut
 
 
@@ -252,7 +303,7 @@ def main():
     os.makedirs("reports", exist_ok=True)
     from cob_national_profile import get_pdf     # uses the cache if present, otherwise downloads (about 15 MB)
     path, _sha = get_pdf()
-    cands = prefilter(path)
+    cands = list(range(PAGE_FROM, min(PAGE_TO, len(PdfReader(path).pages)) + 1))   # every page; pdfplumber skips empty ones fast
     print(f"{len(cands)} candidate pages between {PAGE_FROM} and {PAGE_TO}: {cands[:40]}", flush=True)
     pages_rows, diags = [], {}
     with pdfplumber.open(path) as pdf:
@@ -273,6 +324,9 @@ def main():
     for i, t in enumerate(tables, 1):
         c = t["check"]
         lines.append(f"- Table {i}: pages {t['pages']}, {len(t['rows'])} rows, check: {c}")
+        bad_rows = [(r['name'][:30], r['row_check']) for r in t['rows'] if r.get('row_check') not in (None, 'ok')]
+        if bad_rows:
+            lines.append(f"    rows failing their own percentage check: {bad_rows[:6]}")
         lines.append(f"    first names: {[r['name'][:40] for r in t['rows'][:4]]}; "
                      f"names flagged uncertain: {sum(1 for r in t['rows'] if r.get('name_uncertain'))}")
     text = "\n".join(lines)
