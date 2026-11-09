@@ -17,7 +17,7 @@ from pypdf import PdfReader
 CACHE = os.path.join("pdf_cache", "national_annual_2025_26.pdf")
 PAGE_FROM, PAGE_TO = 90, 340        # chapter 4 sector analyses; widen if tables are missing
 PRE_MIN_NUMBER_LINES = 1            # a candidate page has at least this many lines with 10+ numbers
-MIN_VALUES = 8                      # numbers needed on a line to count as a data row
+MIN_VALUES = 6                      # numbers needed on a line to count as a row (12 for votes, 6 for sector summaries)
 ROW_TOL = 3.5                       # points: numbers within this vertical distance share a row
 LINE_TOL = 2.5                      # points: name words within this share a name line
 MAX_NAME_DY = 3.2                   # name lines farther than this many line-spacings from a row are ignored
@@ -248,8 +248,8 @@ def page_rows(page, diag=None):
         ln["text"] = " ".join(w["text"] for w in sorted(ln["words"], key=lambda w: w["x0"]))
         ln["bold"] = any("bold" in (w.get("fontname") or "").lower() for w in ln["words"])
     bold, rest, bold_lines = [], [], []
-    spacing = sorted(b["yc"] - a["yc"] for a, b in zip(lines, lines[1:]) if 4 < b["yc"] - a["yc"] < 20)
-    line_h = spacing[len(spacing) // 2] if spacing else 10.0
+    spacing = sorted(b["yc"] - a["yc"] for a, b in zip(lines, lines[1:]) if 7 < b["yc"] - a["yc"] < 25)
+    line_h = spacing[len(spacing) // 4] if spacing else 10.0     # lower quartile = spacing inside one name
     for ln in lines:                      # name text printed on the numbers line itself (bold 'Total' included)
         near = min(rows, key=lambda r: abs(r["yc"] - ln["yc"]))
         if abs(near["yc"] - ln["yc"]) <= LINE_TOL + 1.0:
@@ -283,8 +283,12 @@ def page_rows(page, diag=None):
             others = [abs(y - rows[k]["yc"]) for k in (j - 1, j + 1) if 0 <= k < len(rows)]
             if own > LINE_TOL + 1.0 and others and abs(own - min(others)) < 1.5:
                 uncertain = True
-        out.append({"name": join_name(frags), "name_lines": frags, "values": r["values"], "yc": round(r["yc"], 1),
-                    "name_uncertain": uncertain and method != "gaps", "row_check": None if re.fullmatch(r"(?i)total", join_name(frags).strip()) else row_check(r["values"])})
+        name = join_name(frags)
+        own = (r.get("own_text") or "").strip()
+        if own.lower() in ("total", "development", "recurrent"):
+            name, frags = own, [own]       # summary and Total rows are named by their own line only
+        out.append({"name": name, "name_lines": frags, "values": r["values"], "yc": round(r["yc"], 1),
+                    "name_uncertain": uncertain and method != "gaps", "row_check": None if re.fullmatch(r"(?i)total|development|recurrent", name.strip()) else row_check(r["values"])})
     if diag is not None:
         diag.update({"first_numeric_column_cut_x": round(cut, 1), "name_column_right_edge": round(name_right, 1),
                      "rows": len(out), "constraint_split_ok": ok, "name_assignment": method,
@@ -292,41 +296,77 @@ def page_rows(page, diag=None):
     return out, cut
 
 
+def _col_diffs(body, ref, cols):
+    out = []
+    for j, rj in cols:
+        tv = to_float(ref[rj]) if rj < len(ref) else None
+        col = [to_float(r["values"][j]) for r in body]
+        if tv is None or abs(tv) <= 1e-9:
+            continue
+        out.append((j, round(100 * abs(sum(x or 0 for x in col) - tv) / abs(tv), 3)))
+    return out
+
+
 def assemble(pages_rows):
-    """Join rows across pages; each table ends at a row named 'Total'. Check column sums against it."""
-    tables, cur = [], {"rows": [], "pages": []}
+    """Join vote rows across consecutive pages. A table ends at a 12-column 'Total' row or at the 6-column sector
+    summary (Development / Recurrent / Total). Tables are checked against whichever they have."""
+    tables, cur, last_pg = [], {"rows": [], "pages": []}, None
+
+    def fresh():
+        return {"rows": [], "pages": []}
+
     for pg, rows in pages_rows:
+        if cur["rows"] and last_pg is not None and pg - last_pg > 1:
+            cur["open"] = True
+            tables.append(cur)
+            cur = fresh()
         for r in rows:
             r = dict(r, page=pg)
+            n, name = len(r["values"]), r["name"].strip().lower()
+            if n == 6 and name in ("development", "recurrent", "total"):
+                target = cur if cur["rows"] else (tables[-1] if tables else None)
+                if target is not None:
+                    target.setdefault("summary", {})[name] = r["values"]
+                if name == "total" and cur["rows"]:
+                    tables.append(cur)
+                    cur = fresh()
+                continue
+            if n != 12:
+                cur.setdefault("skipped", []).append(r)       # project tables, KPI tables, etc.
+                continue
             cur["rows"].append(r)
             if pg not in cur["pages"]:
                 cur["pages"].append(pg)
+            last_pg = pg
             if re.fullmatch(r"(?i)total", r["name"].strip()):
+                cur["has_total_row"] = True
                 tables.append(cur)
-                cur = {"rows": [], "pages": []}
+                cur = fresh()
     if cur["rows"]:
         cur["open"] = True
         tables.append(cur)
+    tables = [t for t in tables if t["rows"]]
     for t in tables:
-        if t.get("open") or len(t["rows"]) < 2:
-            t["check"] = {"status": "no Total row found"}
-            continue
-        body, total = t["rows"][:-1], t["rows"][-1]
-        ncols = len(total["values"])
-        diffs = []
-        for j in range(ncols):
-            tv = to_float(total["values"][j])
-            col = [to_float(r["values"][j]) for r in body if len(r["values"]) == ncols]
-            if tv is None or not col or abs(tv) <= 1e-9:
-                continue
-            if ncols == 12 and j % 6 in (4, 5):
-                continue   # percentage columns of the 12-column vote tables
-            s = sum(x or 0 for x in col)
-            diffs.append((j, round(100 * abs(s - tv) / abs(tv), 3)))
-        bad_len = sum(1 for r in body if len(r["values"]) != ncols)
-        t["check"] = {"ncols": ncols, "rows": len(body), "rows_with_other_column_count": bad_len,
-                      "worst_sum_diff_pct": max((d for _, d in diffs), default=0.0),
-                      "columns_off_by_over_0.5pct": [j for j, d in diffs if d > 0.5]}
+        rows = t["rows"]
+        has_total = t.get("has_total_row")
+        body = rows[:-1] if has_total else rows
+        checks = {}
+        if has_total and len(rows) >= 2:
+            total = rows[-1]["values"]
+            d = _col_diffs(body, total, [(j, j) for j in (0, 1, 2, 3, 6, 7, 8, 9)])
+            checks["against_total_row"] = {"worst_sum_diff_pct": max((x for _, x in d), default=0.0),
+                                           "columns_off_by_over_0.5pct": [j for j, x in d if x > 0.5]}
+        summ = t.get("summary", {})
+        if "development" in summ and "recurrent" in summ:
+            d = _col_diffs(body, summ["development"], [(j, j) for j in range(4)]) + \
+                _col_diffs(body, summ["recurrent"], [(j + 6, j) for j in range(4)])
+            checks["against_sector_summary"] = {"worst_sum_diff_pct": max((x for _, x in d), default=0.0),
+                                                "columns_off_by_over_0.5pct": [j for j, x in d if x > 0.5]}
+        worst = max((v["worst_sum_diff_pct"] for v in checks.values()), default=None)
+        t["check"] = {"rows": len(body), "checks": checks,
+                      "rows_with_other_column_count": len(t.get("skipped", [])),
+                      "worst_sum_diff_pct": worst if worst is not None else "no Total row or sector summary found",
+                      "columns_off_by_over_0.5pct": sorted({j for v in checks.values() for j in v["columns_off_by_over_0.5pct"]})}
     return tables
 
 
