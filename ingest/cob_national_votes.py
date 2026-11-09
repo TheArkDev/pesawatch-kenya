@@ -21,6 +21,7 @@ MIN_VALUES = 8                      # numbers needed on a line to count as a dat
 ROW_TOL = 3.5                       # points: numbers within this vertical distance share a row
 LINE_TOL = 2.5                      # points: name words within this share a name line
 MAX_NAME_DY = 3.2                   # name lines farther than this many line-spacings from a row are ignored
+DANGLING = re.compile(r"(?:^|\s)(?:State|The|of|for|and|the|&|on)$")   # a name block cannot end on these words
 NUMW = re.compile(r"\(?-?\d[\d,]*(?:\.\d+)?\)?%?|[-\u2013\u2014]")
 NUM_TOKEN = re.compile(r"(?<!\S)(?:\(?-?\d[\d,]*(?:\.\d+)?\)?|-)(?!\S)")
 
@@ -86,7 +87,20 @@ def assign_by_blocks(rows, rest, line_h):
             continue                      # heading or footer text far from any numbers row
         else:
             return False                  # two rows in one block: padding too small to tell
+    # Geometry alone can be wrong: reject block names that read badly, so the constrained search runs instead.
+    drafts = []
     for owner, texts in plan:
+        lines_ = [t for _, t in sorted(owner["frags"] + [(l["yc"], l["text"]) for l in texts])]
+        drafts.append((owner, texts, lines_))
+    for k, (owner, texts, lines_) in enumerate(drafts):
+        if not lines_:
+            continue
+        last_row = k == len(drafts) - 1
+        if not last_row and (lines_[-1].rstrip().endswith("-") or DANGLING.search(lines_[-1].strip())):
+            return False
+        if lines_[0][:1].islower():
+            return False
+    for owner, texts, _lines in drafts:
         owner["frags"] += [(l["yc"], l["text"]) for l in texts]
     return True
 
@@ -127,7 +141,12 @@ def split_names(rows, lines, line_h=10.0):
                 # A line ending in a hyphen continues on the next line, so the two must belong to the same row.
                 last_text = tail[-1]["text"] if tail else rows[j].get("own_text", "")
                 more_follows = (t < len(gaps[j + 1])) or j < n - 1
-                if more_follows and last_text.rstrip().endswith("-"):
+                if more_follows and (last_text.rstrip().endswith("-") or DANGLING.search(last_text.strip())):
+                    cost += 1000.0
+                # a block cannot begin with a lowercase continuation ("on Administrative Justice", "partment")
+                nxt_first = gaps[j + 1][t]["text"] if t < len(gaps[j + 1]) else (
+                    rows[j + 1].get("own_text", "") if j < n - 1 else "")
+                if nxt_first and nxt_first[:1].islower():
                     cost += 1000.0
                 if j == n - 1:
                     cand = (cost, [(h, t)])
@@ -166,17 +185,22 @@ def split_names(rows, lines, line_h=10.0):
 
 
 def row_check(values):
-    """For the 12-column vote rows: printed percentages must match the amounts (percentages are whole numbers)."""
+    """Vote rows (12 columns, KSh billions to 2 decimals, whole-number percentages): the printed percentage must be
+    possible given amounts that were rounded to the nearest 0.005 and a percentage rounded to the nearest 0.5."""
     if len(values) != 12:
         return "not 12 values"
     v = [to_float(x) for x in values]
     bad = []
-    for base in (0, 6):
+    e = 0.005
+    for base, label in ((0, "development"), (6, "recurrent")):
         gross, net, exch, exp, p_exch, p_exp = v[base:base + 6]
-        if gross and exp is not None and p_exp is not None and abs(100 * exp / gross - p_exp) > 1.01:
-            bad.append(f"expenditure% {round(100 * exp / gross, 1)} vs printed {p_exp}")
-        if net and exch is not None and p_exch is not None and abs(100 * exch / net - p_exch) > 1.01:
-            bad.append(f"exchequer% {round(100 * exch / net, 1)} vs printed {p_exch}")
+        for num, den, pr, what in ((exp, gross, p_exp, "expenditure"), (exch, net, p_exch, "exchequer")):
+            if num is None or den is None or pr is None or den <= 0:
+                continue
+            lo = 100 * max(num - e, 0) / (den + e) - 0.5
+            hi = 100 * (num + e) / max(den - e, 1e-9) + 0.5
+            if not (lo <= pr <= hi):
+                bad.append(f"{label} {what}% {round(100 * num / den, 1)} vs printed {pr}")
     return "ok" if not bad else "; ".join(bad)
 
 
@@ -223,7 +247,7 @@ def page_rows(page, diag=None):
     for ln in lines:
         ln["text"] = " ".join(w["text"] for w in sorted(ln["words"], key=lambda w: w["x0"]))
         ln["bold"] = any("bold" in (w.get("fontname") or "").lower() for w in ln["words"])
-    bold, rest = [], []
+    bold, rest, bold_lines = [], [], []
     spacing = sorted(b["yc"] - a["yc"] for a, b in zip(lines, lines[1:]) if 4 < b["yc"] - a["yc"] < 20)
     line_h = spacing[len(spacing) // 2] if spacing else 10.0
     for ln in lines:                      # name text printed on the numbers line itself (bold 'Total' included)
@@ -232,9 +256,16 @@ def page_rows(page, diag=None):
             near["frags"].append((ln["yc"], ln["text"]))
             near["own_text"] = (near.get("own_text", "") + " " + ln["text"]).strip()
         elif ln["bold"]:
-            bold.append(ln["text"])       # bold text away from the numbers is a heading
+            bold_lines.append(ln)         # bold text away from the numbers is a heading ... unless it is 'Total'
+            bold.append(ln["text"])
         elif not re.match(r"(?i)^(source|note)\b", ln["text"]):
             rest.append(ln)
+    for ln in bold_lines:                 # a bold 'Total' sitting a few points off its numbers line
+        if re.fullmatch(r"(?i)total", ln["text"].strip()):
+            near = min(rows, key=lambda r: abs(r["yc"] - ln["yc"]))
+            if not near.get("own_text") and abs(near["yc"] - ln["yc"]) <= 1.6 * line_h:
+                near["frags"].append((ln["yc"], ln["text"]))
+                near["own_text"] = ln["text"]
     ys = sorted([r["yc"] for r in rows] + [l["yc"] for l in rest])
     deltas = [round(b - a, 1) for a, b in zip(ys, ys[1:])][:30]     # real row padding, for tuning
     ok = assign_by_blocks(rows, rest, line_h)
@@ -314,9 +345,16 @@ def main():
             except Exception as e:  # noqa: BLE001
                 rows, d = [], {"error": f"{type(e).__name__}: {str(e)[:150]}"}
             pages_rows.append((pg, rows))
-            if n < 3:
+            if rows and len(diags) < 3:
                 diags[str(pg)] = d
     tables = assemble(pages_rows)
+    import csv
+    with open("reports/vote_names_review.csv", "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["table", "page", "name_as_read", "name_lines", "uncertain", "values_count", "row_check"])
+        for i, t in enumerate(tables, 1):
+            for r in t["rows"]:
+                w.writerow([i, r["page"], r["name"], " | ".join(r["name_lines"]), r.get("name_uncertain"), len(r["values"]), r.get("row_check")])
     res = {"candidate_pages": cands, "diagnostics": diags, "tables": tables}
     with open("reports/cob_national_votes.json", "w", encoding="utf-8") as f:
         json.dump(res, f, indent=1, ensure_ascii=False)
