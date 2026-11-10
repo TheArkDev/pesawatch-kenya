@@ -184,6 +184,40 @@ def split_names(rows, lines, line_h=10.0):
     return True
 
 
+def attach_orphan_numbers(rows, words, used, clusters):
+    """Some cells (often the first columns) are printed a little above or below the rest of their row, so they fall
+    outside the row's cluster and then look like part of the name. For a row with fewer than 12 numbers, take numeric
+    words that are vertically close to it, belong to no other row, and sit to the right of the row's name text."""
+    if len(rows) < 1:
+        return
+    ys = sorted(r["yc"] for r in rows)
+    for r in rows:
+        if len(r["values"]) >= 12 or len(r["values"]) < 6:
+            continue
+        above = [y for y in ys if y < r["yc"]]
+        below = [y for y in ys if y > r["yc"]]
+        reach = 40.0
+        if above:
+            reach = min(reach, (r["yc"] - max(above)) / 2.0)
+        if below:
+            reach = min(reach, (min(below) - r["yc"]) / 2.0)
+        near = [w for w in words if id(w) not in used and abs(w["yc"] - r["yc"]) <= reach]
+        text_right = max((w["x1"] for w in near if not NUMW.fullmatch(w["text"])), default=None)
+        first_x0 = min(x for x, _ in r["cells"])
+        picks = [w for w in near if NUMW.fullmatch(w["text"]) and w["x1"] <= first_x0 + 3
+                 and (text_right is None or w["x0"] > text_right - 1)]
+        if not picks or len(r["values"]) + len(picks) > 12:
+            r["nearby_unused_numbers"] = [(w["text"], round(w["x0"], 1), round(w["yc"] - r["yc"], 1)) for w in near
+                                          if NUMW.fullmatch(w["text"])][:12]
+            continue
+        for w in picks:
+            used.add(id(w))
+        cells = sorted(r["cells"] + [(w["x0"], w["text"]) for w in picks])
+        r["cells"] = cells
+        r["values"] = [t for _, t in cells]
+        r["orphans_added"] = len(picks)
+
+
 SUMMARY_NAMES = {"development", "recurrent", "total"}
 
 
@@ -207,6 +241,7 @@ def merge_split_rows(rows, lines, line_h):
                 and (all_dash(r) != all_dash(nxt))
                 and own_name(r) not in SUMMARY_NAMES and own_name(nxt) not in SUMMARY_NAMES):
             out.append({"yc": (r["yc"] + nxt["yc"]) / 2.0, "values": r["values"] + nxt["values"], "frags": [],
+                        "cells": r.get("cells", []) + nxt.get("cells", []),
                         "own_tol": 0.6 * line_h + 0.5, "merged_two_lines": True})
             i += 2
         else:
@@ -265,7 +300,8 @@ def page_rows(page, diag=None):
         used |= {id(w) for w in vals}
         left_edges.append(min(w["x0"] for w in vals))
         rows.append({"yc": sum(w["yc"] for w in merged) / len(merged), "values": [m["text"] for m in merged],
-                     "frags": []})
+                     "cells": [(m["x0"], m["text"]) for m in merged], "frags": []})
+    attach_orphan_numbers(rows, words, used, clusters)
     name_right = min(left_edges) - 1
     name_words = [w for w in words if id(w) not in used and w["x1"] <= name_right and not re.fullmatch(r"\d+", w["text"])]
     name_words.sort(key=lambda w: (w["yc"], w["x0"]))
@@ -320,6 +356,7 @@ def page_rows(page, diag=None):
         if own.lower() in ("total", "development", "recurrent"):
             name, frags = own, [own]       # summary and Total rows are named by their own line only
         out.append({"name": name, "name_lines": frags, "values": r["values"], "yc": round(r["yc"], 1),
+                    "orphans_added": r.get("orphans_added", 0), "nearby_unused_numbers": r.get("nearby_unused_numbers"),
                     "name_uncertain": uncertain and method != "gaps", "row_check": None if re.fullmatch(r"(?i)total|development|recurrent", name.strip()) else row_check(r["values"])})
     if diag is not None:
         diag.update({"first_numeric_column_cut_x": round(cut, 1), "name_column_right_edge": round(name_right, 1),
