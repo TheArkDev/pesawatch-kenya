@@ -184,6 +184,37 @@ def split_names(rows, lines, line_h=10.0):
     return True
 
 
+SUMMARY_NAMES = {"development", "recurrent", "total"}
+
+
+def merge_split_rows(rows, lines, line_h):
+    """Some votes print their two halves on two lines: six dashes (no development budget) on one line and the six
+    recurrent numbers on the next. Merge two adjacent six-number rows into one 12-number row, but only when exactly one
+    of them is all dashes (so two separate recurrent-only votes are never joined) and neither is a summary row."""
+    def own_name(r):
+        near = [ln for ln in lines if abs(ln["yc"] - r["yc"]) <= LINE_TOL + 1.0]
+        return " ".join(ln["text"] for ln in near).strip().lower()
+
+    def all_dash(r):
+        return all(v in ("-", "\u2013", "\u2014") for v in r["values"])
+
+    out, i = [], 0
+    while i < len(rows):
+        r = rows[i]
+        nxt = rows[i + 1] if i + 1 < len(rows) else None
+        if (nxt and len(r["values"]) == 6 and len(nxt["values"]) == 6
+                and nxt["yc"] - r["yc"] <= 1.3 * line_h
+                and (all_dash(r) != all_dash(nxt))
+                and own_name(r) not in SUMMARY_NAMES and own_name(nxt) not in SUMMARY_NAMES):
+            out.append({"yc": (r["yc"] + nxt["yc"]) / 2.0, "values": r["values"] + nxt["values"], "frags": [],
+                        "own_tol": 0.6 * line_h + 0.5, "merged_two_lines": True})
+            i += 2
+        else:
+            out.append(r)
+            i += 1
+    return out
+
+
 def row_check(values):
     """Vote rows (12 columns, KSh billions to 2 decimals, whole-number percentages): the printed percentage must be
     possible given amounts that were rounded to the nearest 0.005 and a percentage rounded to the nearest 0.5."""
@@ -250,9 +281,10 @@ def page_rows(page, diag=None):
     bold, rest, bold_lines = [], [], []
     spacing = sorted(b["yc"] - a["yc"] for a, b in zip(lines, lines[1:]) if 7 < b["yc"] - a["yc"] < 25)
     line_h = spacing[len(spacing) // 4] if spacing else 10.0     # lower quartile = spacing inside one name
+    rows = merge_split_rows(rows, lines, line_h)
     for ln in lines:                      # name text printed on the numbers line itself (bold 'Total' included)
         near = min(rows, key=lambda r: abs(r["yc"] - ln["yc"]))
-        if abs(near["yc"] - ln["yc"]) <= LINE_TOL + 1.0:
+        if abs(near["yc"] - ln["yc"]) <= near.get("own_tol", LINE_TOL + 1.0):
             near["frags"].append((ln["yc"], ln["text"]))
             near["own_text"] = (near.get("own_text", "") + " " + ln["text"]).strip()
         elif ln["bold"]:
@@ -296,6 +328,44 @@ def page_rows(page, diag=None):
     return out, cut
 
 
+def place_half_rows(t):
+    """A vote with only a recurrent (or only a development) budget can print just 6 numbers, so it is skipped as
+    'not 12 values'. If the table has a 12-column Total row and exactly one such row would make every money column
+    add up, and only one half (development or recurrent) fits, place it there. Arithmetic decides, not guesses."""
+    if not t.get("has_total_row") or len(t["rows"]) < 2:
+        return
+    body, total = t["rows"][:-1], t["rows"][-1]["values"]
+    money = [0, 1, 2, 3, 6, 7, 8, 9]
+    resid = {}
+    for j in money:
+        tv = to_float(total[j])
+        if tv is None:
+            return
+        resid[j] = tv - sum((to_float(r["values"][j]) or 0.0) for r in body)
+    if max(abs(v) for v in resid.values()) < 0.03:
+        return                                 # nothing is missing
+    cands = [x for x in t.get("skipped", []) if len(x["values"]) == 6 and x["page"] in t["pages"]]
+    fits = []
+    for x in cands:
+        v = [to_float(a) for a in x["values"][:4]]
+        if None in v:
+            continue
+        for half, cols, other in (("development", [0, 1, 2, 3], [6, 7, 8, 9]), ("recurrent", [6, 7, 8, 9], [0, 1, 2, 3])):
+            if all(abs(resid[c] - v[k]) <= 0.03 for k, c in enumerate(cols)) and all(abs(resid[c]) <= 0.03 for c in other):
+                fits.append((x, half))
+    if len(fits) != 1:
+        return
+    x, half = fits[0]
+    dash = ["-"] * 6
+    row = dict(x, values=(x["values"] + dash) if half == "development" else (dash + x["values"]),
+               placed_by_totals=half, name_uncertain=x.get("name_uncertain", False))
+    row["row_check"] = row_check(row["values"])
+    total_row = t["rows"][-1]
+    votes = sorted(t["rows"][:-1] + [row], key=lambda r: (r["page"], r["yc"]))     # yc grows down the page
+    t["rows"] = votes + [total_row]
+    t["skipped"] = [y for y in t["skipped"] if y is not x]
+
+
 def _col_diffs(body, ref, cols):
     out = []
     for j, rj in cols:
@@ -324,7 +394,9 @@ def assemble(pages_rows):
             r = dict(r, page=pg)
             n, name = len(r["values"]), r["name"].strip().lower()
             if n == 6 and name in ("development", "recurrent", "total"):
-                target = cur if cur["rows"] else (tables[-1] if tables else None)
+                target = cur if cur["rows"] else None
+                if target is None and tables and last_pg is not None and pg - last_pg <= 1:
+                    target = tables[-1]        # the summary right after a closed table; a far-away one is another table's
                 if target is not None:
                     target.setdefault("summary", {})[name] = r["values"]
                 if name == "total" and cur["rows"]:
@@ -346,6 +418,8 @@ def assemble(pages_rows):
         cur["open"] = True
         tables.append(cur)
     tables = [t for t in tables if t["rows"]]
+    for t in tables:
+        place_half_rows(t)
     for t in tables:
         rows = t["rows"]
         has_total = t.get("has_total_row")
