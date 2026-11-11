@@ -45,7 +45,10 @@ def to_float(tok):
     if t in ("-", "\u2013", "\u2014", ""):
         return None
     neg = t.startswith("(") and t.endswith(")")
-    t = t.strip("()%").replace(",", "")
+    t = t.strip("()%")
+    if re.fullmatch(r"\d{1,3},\d{1,2}", t):      # "1,07": thousands groups have 3 digits, so this is a decimal comma
+        t = t.replace(",", ".")
+    t = t.replace(",", "")
     try:
         v = float(t)
     except ValueError:
@@ -479,6 +482,23 @@ def assemble(pages_rows):
                       "worst_sum_diff_pct": worst if worst is not None else "no Total row or sector summary found",
                       "columns_off_by_over_0.5pct": sorted({j for v in checks.values() for j in v["columns_off_by_over_0.5pct"]})}
     return tables
+
+
+def extract_tables(path, verbose=True):
+    """Read pages PAGE_FROM..PAGE_TO and return (tables, diagnostics)."""
+    cands = list(range(PAGE_FROM, min(PAGE_TO, len(PdfReader(path).pages)) + 1))
+    pages_rows, diags = [], {}
+    with pdfplumber.open(path) as pdf:
+        for pg in cands:
+            d = {}
+            try:
+                rows, _ = page_rows(pdf.pages[pg - 1], d)
+            except Exception as e:  # noqa: BLE001
+                rows, d = [], {"error": f"{type(e).__name__}: {str(e)[:150]}"}
+            pages_rows.append((pg, rows))
+            if rows and len(diags) < 3:
+                diags[str(pg)] = d
+    return assemble(pages_rows), diags
 
 
 def main():
