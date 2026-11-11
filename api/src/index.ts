@@ -8,6 +8,7 @@
 // GET /counties/:code?fy=2025      one county (code 1-47) and its buyers
 // GET /suppliers/top?fy=&limit=20  suppliers by awarded value (name-matched, see notes)
 // GET /budget/counties?fy=2025     county approved budget, exchequer issues, expenditure, absorption
+// GET /national?fy=2025            national government votes by sector: revised budget, exchequer issues, expenditure
 
 export interface Env {
   DB: D1Database;
@@ -28,6 +29,13 @@ const BUDGET_NOTES = [
   "Absorption rate is reported expenditure divided by the approved budget. A low rate can reflect delays or late releases; it is not by itself evidence of wrongdoing.",
   "Pending bills are amounts a county owed suppliers, staff and statutory bodies at year end but had not paid, as reported by counties. They include unpaid salaries and statutory deductions.",
   "The source reports in KSh millions, so amounts are rounded to that level. Each figure carries the report table and PDF page it came from.",
+];
+
+const NATIONAL_NOTES = [
+  "Source: Office of the Controller of Budget, National Government Budget Implementation Review Report (annual), sector analyses. Figures are as reported by ministries, departments and agencies and are not audited.",
+  "Revised budget is the revised gross estimate after supplementary budgets, including appropriations in aid. Exchequer issues are funds released by the National Treasury. Expenditure is as reported. These are different measures and must not be read as one another.",
+  "The source reports in KSh billions to two decimals, so amounts are rounded to that level. Each figure carries its sector analysis and PDF page.",
+  "The Ministry of Defence is not included: the report gives no comparable recurrent figures for it. Some figures are marked as not passing the automatic arithmetic checks and carry a note saying why.",
 ];
 
 const CORS = { "Access-Control-Allow-Origin": "*" };
@@ -71,13 +79,13 @@ function coverage(fy: number, first: string | null, last: string | null) {
   return { first_release_date: first, last_release_date: last, in_progress: inProgress, complete: warnings.length === 0, warnings };
 }
 
-async function provenance(db: D1Database, sourceId = "ppip_ocds") {
+async function provenance(db: D1Database, sourceId = "ppip_ocds", docKind: string | null = null) {
   const { results } = await db
     .prepare(
       "SELECT title, url, retrieved_at, substr(sha256,1,12) AS sha256_prefix FROM source_documents " +
-        "WHERE source_id = ? AND status = 'available' ORDER BY retrieved_at DESC LIMIT 5"
+        "WHERE source_id = ? AND status = 'available' AND (? IS NULL OR doc_kind = ?) ORDER BY retrieved_at DESC LIMIT 5"
     )
-    .bind(sourceId)
+    .bind(sourceId, docKind, docKind)
     .all();
   return results;
 }
@@ -86,6 +94,17 @@ type BudgetRow = {
   county_code: number; name: string; approved_budget: number | null; exchequer_release: number | null;
   reported_expenditure: number | null; dev_approved: number | null; dev_expenditure: number | null;
   pending_bills: number | null;
+};
+
+type Half = { revised: number | null; exchequer: number | null; expenditure: number | null };
+const emptyHalf = (): Half => ({ revised: null, exchequer: null, expenditure: null });
+type NationalFact = {
+  entity_id: number; name: string; kind: string; sector_id: number; spend_type: string; measure: string;
+  amount_kes: number; review_status: string; note: string | null; page_ref: string | null;
+};
+type NationalVote = {
+  entity_id: number; name: string; kind: string; sector_id: number; development: Half; recurrent: Half;
+  unreviewed: boolean; notes: string[]; pages: string[];
 };
 
 const pct = (num: number | null, den: number | null): number | null =>
@@ -175,7 +194,69 @@ export default {
             pending_pct_of_budget: pct(r.pending_bills, r.approved_budget),
           })),
           totals: { ...totals, absorption_pct: pct(totals.reported_expenditure, totals.approved_budget), dev_absorption_pct: pct(totals.dev_expenditure, totals.dev_approved), pending_pct_of_budget: pct(totals.pending_bills, totals.approved_budget) },
-          data_flags: flags, notes: BUDGET_NOTES, source: await provenance(db, "cob"),
+          data_flags: flags, notes: BUDGET_NOTES, source: await provenance(db, "cob", "county_birr"),
+        });
+      }
+
+      if (path === "/national") {
+        let fy: number | null;
+        const q = url.searchParams.get("fy");
+        if (q !== null) {
+          const n = Number(q);
+          fy = Number.isInteger(n) && n >= 2010 && n <= 2035 ? n : null;
+        } else {
+          const row = await db.prepare("SELECT MAX(fy_start) AS fy FROM fiscal_facts WHERE classification_id BETWEEN 401 AND 410").first<{ fy: number | null }>();
+          fy = row?.fy ?? null;
+        }
+        if (fy === null) return json({ error: "no national data" }, 404);
+        const { results: sectorRows } = await db
+          .prepare("SELECT id, name FROM classifications WHERE id BETWEEN 401 AND 410 ORDER BY id")
+          .all<{ id: number; name: string }>();
+        const { results: facts } = await db
+          .prepare(
+            "SELECT e.id AS entity_id, e.name, e.kind, f.classification_id AS sector_id, f.spend_type, f.measure, f.amount_kes, " +
+              "f.review_status, f.note, f.page_ref FROM fiscal_facts f JOIN entities e ON e.id = f.entity_id " +
+              "WHERE f.fy_start = ? AND f.as_of_period = 'annual' AND f.classification_id BETWEEN 401 AND 410 " +
+              "ORDER BY f.classification_id, e.name"
+          )
+          .bind(fy)
+          .all<NationalFact>();
+        if (facts.length === 0) return json({ error: `no national data for fy ${fy}` }, 404);
+        const votes = new Map<string, NationalVote>();
+        for (const f of facts) {
+          const key = `${f.sector_id}:${f.entity_id}`;
+          let v = votes.get(key);
+          if (!v) {
+            v = { entity_id: f.entity_id, name: f.name, kind: f.kind, sector_id: f.sector_id, development: emptyHalf(), recurrent: emptyHalf(),
+                  unreviewed: false, notes: [], pages: [] };
+            votes.set(key, v);
+          }
+          const half = f.spend_type === "development" ? v.development : f.spend_type === "recurrent" ? v.recurrent : null;
+          const field = f.measure === "revised_budget" ? "revised" : f.measure === "exchequer_release" ? "exchequer" : f.measure === "reported_expenditure" ? "expenditure" : null;
+          if (half && field) half[field] = f.amount_kes;
+          if (f.review_status !== "checked") v.unreviewed = true;
+          if (f.note && !v.notes.includes(f.note)) v.notes.push(f.note);
+          if (f.page_ref && !v.pages.includes(f.page_ref)) v.pages.push(f.page_ref);
+        }
+        const addHalf = (a: Half, b: Half): Half => ({
+          revised: (a.revised ?? 0) + (b.revised ?? 0), exchequer: (a.exchequer ?? 0) + (b.exchequer ?? 0),
+          expenditure: (a.expenditure ?? 0) + (b.expenditure ?? 0),
+        });
+        const national = { development: emptyHalf(), recurrent: emptyHalf() };
+        const sectors = sectorRows.map((sec) => {
+          const vs = [...votes.values()].filter((v) => v.sector_id === sec.id);
+          const totals = { development: emptyHalf(), recurrent: emptyHalf() };
+          for (const v of vs) {
+            totals.development = addHalf(totals.development, v.development);
+            totals.recurrent = addHalf(totals.recurrent, v.recurrent);
+          }
+          national.development = addHalf(national.development, totals.development);
+          national.recurrent = addHalf(national.recurrent, totals.recurrent);
+          return { id: sec.id, name: sec.name, totals, votes: vs };
+        });
+        return json({
+          fy, label: `${fy}/${String(fy + 1).slice(2)}`, national_totals: national, sectors,
+          notes: NATIONAL_NOTES, source: await provenance(db, "cob", "national_birr"),
         });
       }
 
@@ -220,7 +301,7 @@ export default {
         return json({
           fy, county: ent, buyers, notes: NOTES, source: await provenance(db),
           budget_facts: budgetFacts, budget_notes: BUDGET_NOTES,
-          budget_source: budgetFacts.length ? await provenance(db, "cob") : [],
+          budget_source: budgetFacts.length ? await provenance(db, "cob", "county_birr") : [],
         });
       }
 
