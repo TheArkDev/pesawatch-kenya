@@ -9,6 +9,7 @@
 // GET /suppliers/top?fy=&limit=20  suppliers by awarded value (name-matched, see notes)
 // GET /budget/counties?fy=2025     county approved budget, exchequer issues, expenditure, absorption
 // GET /national?fy=2025            national government votes by sector: revised budget, exchequer issues, expenditure
+// GET /gpris                       projects reported on GPRIS (a small pilot-sized list) with our quality flags
 
 export interface Env {
   DB: D1Database;
@@ -36,6 +37,12 @@ const NATIONAL_NOTES = [
   "Revised budget is the revised gross estimate after supplementary budgets, including appropriations in aid. Exchequer issues are funds released by the National Treasury. Expenditure is as reported. These are different measures and must not be read as one another.",
   "The source reports in KSh billions to two decimals, so amounts are rounded to that level. Each figure carries its sector analysis and PDF page.",
   "The Ministry of Defence is not included: the report gives no comparable recurrent figures for it. Some figures are marked as not passing the automatic arithmetic checks and carry a note saying why.",
+];
+
+const GPRIS_NOTES = [
+  "Source: GPRIS (gpris.go.ke), the government's project reporting portal. Figures are as reported by implementing agencies and, as GPRIS itself states, are subject to field verification.",
+  "GPRIS currently lists only a small number of projects in a few counties. A county with no projects here does not mean it has none.",
+  "Flags are PesaWatch checks on the reported figures (for example, money disbursed above the allocation). They point to inconsistent data and are not findings about any agency or person.",
 ];
 
 const CORS = { "Access-Control-Allow-Origin": "*" };
@@ -258,6 +265,18 @@ export default {
           fy, label: `${fy}/${String(fy + 1).slice(2)}`, national_totals: national, sectors,
           notes: NATIONAL_NOTES, source: await provenance(db, "cob", "national_birr"),
         });
+      }
+
+      if (path === "/gpris") {
+        const { results: projects } = await db
+          .prepare(
+            "SELECT project_id, name, description, sector, ministry, state_department, programme_name, project_level, county_name, county_code, " +
+              "constituency, ward, lat, lng, allocated_kes, disbursed_kes, funding_source, start_date, expected_completion, last_updated, " +
+              "progress_pct, status, latest_update, gpris_verification, quality_flags, last_seen_at FROM gpris_projects ORDER BY name LIMIT 200"
+          )
+          .all();
+        const stats = await db.prepare("SELECT * FROM gpris_stats ORDER BY observed_on DESC LIMIT 1").first();
+        return json({ projects, stats, notes: GPRIS_NOTES, source: await provenance(db, "gpris") });
       }
 
       if (path === "/counties") {
