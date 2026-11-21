@@ -10,6 +10,7 @@
 // GET /budget/counties?fy=2025     county approved budget, exchequer issues, expenditure, absorption
 // GET /national?fy=2025            national government votes by sector: revised budget, exchequer issues, expenditure
 // GET /gpris                       projects reported on GPRIS (a small pilot-sized list) with our quality flags
+// GET /national/finances           headline national series: budget performance, debt service, debt stock, compensation, pending bills
 
 export interface Env {
   DB: D1Database;
@@ -43,6 +44,14 @@ const GPRIS_NOTES = [
   "Source: GPRIS (gpris.go.ke), the government's project reporting portal. Figures are as reported by implementing agencies and, as GPRIS itself states, are subject to field verification.",
   "GPRIS currently lists only a small number of projects in a few counties. A county with no projects here does not mean it has none.",
   "Flags are PesaWatch checks on the reported figures (for example, money disbursed above the allocation). They point to inconsistent data and are not findings about any agency or person.",
+];
+
+const FINANCE_NOTES = [
+  "Source: Office of the Controller of Budget, National Government Budget Implementation Review Report (annual), as published. Figures are not audited.",
+  "Consolidated Fund Services are payments the Constitution requires to be made from the Consolidated Fund ahead of other spending: chiefly public debt service, pensions and some salaries.",
+  "Public debt is a stock at 30 June each year. Debt service is what was paid during the year (principal and interest); the two are different measures.",
+  "Pending bills are unpaid bills at 30 June. Line items for state corporations are not shown yet, only their totals.",
+  "Amounts are shown in whole shillings; the report prints most of them in KSh billions to two decimals.",
 ];
 
 const CORS = { "Access-Control-Allow-Origin": "*" };
@@ -265,6 +274,17 @@ export default {
           fy, label: `${fy}/${String(fy + 1).slice(2)}`, national_totals: national, sectors,
           notes: NATIONAL_NOTES, source: await provenance(db, "cob", "national_birr"),
         });
+      }
+
+      if (path === "/national/finances") {
+        const { results } = await db
+          .prepare(
+            "SELECT section, item, fy_start, period, measure, amount_kes, pct, note, page_ref, review_status FROM national_series " +
+              "ORDER BY section, item, fy_start, period, measure"
+          )
+          .all();
+        if (results.length === 0) return json({ error: "no national finance data" }, 404);
+        return json({ series: results, notes: FINANCE_NOTES, source: await provenance(db, "cob", "national_birr") });
       }
 
       if (path === "/gpris") {
