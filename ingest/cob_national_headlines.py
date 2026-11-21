@@ -207,7 +207,16 @@ def t314(lines):
     rec, dev, sub = by.get("Recurrent"), by.get("Development"), next((r for k, r in by.items() if k.startswith("Sub-Total")), None)
     if rec and dev and sub:
         ok = abs(rec["fy_2026_kes"] + dev["fy_2026_kes"] - sub["fy_2026_kes"]) <= 2 and abs(rec["fy_2025_kes"] + dev["fy_2025_kes"] - sub["fy_2025_kes"]) <= 2
-    return {"rows": rows, "check": {"rows_found": len(rows), "mda_subtotal_ok": ok}}
+    # state-corporation rows: the parts we can rely on without row labels
+    by_label = {r["label"]: r for r in rows}
+    sc_rec = by_label.get("Sub-total (Recurrent)")
+    sc_tot = next((r for k, r in by_label.items() if k.startswith("Sub-Total SCs")), None)
+    sc_dev = next((r for r in rows if r["label"].lower().endswith("opment)")), None)
+    sc_ok = None
+    if sc_rec and sc_dev and sc_tot:
+        sc_ok = (abs(sc_rec["fy_2026_kes"] + sc_dev["fy_2026_kes"] - sc_tot["fy_2026_kes"]) <= 2
+                 and abs(sc_rec["fy_2025_kes"] + sc_dev["fy_2025_kes"] - sc_tot["fy_2025_kes"]) <= 2)
+    return {"rows": rows, "check": {"rows_found": len(rows), "mda_subtotal_ok": ok, "state_corporations_subtotals_ok": sc_ok}}
 
 
 def get_lines(reader, p):
@@ -239,6 +248,7 @@ def main():
     reader = PdfReader(path)
     res = extract(lambda p: get_lines(reader, p))
     res["_pdf_sha256"] = sha
+    res["_raw_lines_3_14"] = [re.sub(r"\s{3,}", "   ", ln.strip())[:170] for p in (88, 89) for ln in get_lines(reader, p)][:140]
     with open("reports/cob_national_headlines.json", "w", encoding="utf-8") as f:
         json.dump(res, f, indent=1, ensure_ascii=False)
     lines = ["## National headline tables", ""]
